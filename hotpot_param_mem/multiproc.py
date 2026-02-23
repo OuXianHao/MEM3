@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence, Set
 
 from .config import RunConfig
-from .data import dedupe_and_sort_by_episode
+from .data import dedupe_and_sort_by_episode, sort_trace_records
 from .logger import read_jsonl, summarize, write_summary
 from .runner import WorkerContext, run_worker
 
@@ -40,6 +40,17 @@ def _merge_jsonl(out_dir: Path, pattern: str, output_name: str):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return merged
 
+def _merge_trace_jsonl(out_dir: Path, pattern: str, output_name: str):
+    records: List[Dict] = []
+    for path in glob.glob(str(out_dir / pattern)):
+        records.extend(read_jsonl(Path(path)))
+
+    merged = sort_trace_records(records)
+    out_path = out_dir / output_name
+    with open(out_path, "w", encoding="utf-8") as f:
+        for rec in merged:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return merged
 
 def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     out_dir = Path(cfg.out)
@@ -53,7 +64,7 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     if not pending:
         print("No pending episodes. Merging existing outputs.")
         merged_eval = _merge_jsonl(out_dir, "eval_results*.jsonl", "eval_results.jsonl")
-        _merge_jsonl(out_dir, "episode_trace*.jsonl", "episode_trace.jsonl")
+        _merge_trace_jsonl(out_dir, "episode_trace*.jsonl", "episode_trace.jsonl")
         write_summary(
             str(out_dir / "summary.json"),
             summarize(merged_eval, {"args": cfg.to_dict(), "newly_completed": 0}),
@@ -85,7 +96,7 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
         if p.exitcode != 0:
             raise RuntimeError(f"Worker failed with code {p.exitcode}")
 
-    merged_trace = _merge_jsonl(out_dir, "episode_trace*.jsonl", "episode_trace.jsonl")
+    merged_trace = _merge_trace_jsonl(out_dir, "episode_trace*.jsonl", "episode_trace.jsonl")
     merged_eval = _merge_jsonl(out_dir, "eval_results*.jsonl", "eval_results.jsonl")
 
     prev_completed = len(done_ids)

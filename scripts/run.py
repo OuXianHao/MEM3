@@ -6,7 +6,13 @@ import random
 
 import numpy as np
 import torch
+import sys
+from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[1]  # ~/MEM3
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+    
 from hotpot_param_mem.config import RunConfig
 from hotpot_param_mem.data import load_hotpot_examples
 from hotpot_param_mem.multiproc import run_multiproc

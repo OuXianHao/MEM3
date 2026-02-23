@@ -25,14 +25,20 @@ class JsonlLogger:
 def read_jsonl(path: Path) -> List[Dict]:
     if not path.exists():
         return []
-    out = []
+    out: List[Dict] = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 out.append(json.loads(line))
+            except json.JSONDecodeError:
+                # Likely a truncated line due to crash/interruption; skip it.
+                # You can uncomment the next line if you want visibility:
+                # print(f"[WARN] Skipping invalid JSONL line {path}:{lineno}")
+                continue
     return out
-
 
 def write_summary(path: str, summary: Dict):
     p = Path(path)

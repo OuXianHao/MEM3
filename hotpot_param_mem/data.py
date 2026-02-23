@@ -41,3 +41,15 @@ def dedupe_and_sort_by_episode(records: Iterable[Dict]) -> List[Dict]:
         episode_id = str(rec["episode_id"])
         by_id[episode_id] = rec
     return [by_id[k] for k in sorted(by_id.keys())]
+
+def sort_trace_records(records: Iterable[Dict]) -> List[Dict]:
+    """Sort step-level trace records stably by (episode_id, step_id). No dedupe."""
+    def _key(rec: Dict):
+        eid = str(rec.get("episode_id", ""))
+        sid = rec.get("step_id", -1)
+        try:
+            sid = int(sid)
+        except Exception:
+            sid = -1
+        return (eid, sid)
+    return sorted(list(records), key=_key)

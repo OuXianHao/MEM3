@@ -1,0 +1,16 @@
+# ---- local data / outputs ----
+data/
+models/
+runs/
+
+# ---- python cache ----
+__pycache__/
+*.py[cod]
+
+# ---- checkpoints / logs ----
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.log

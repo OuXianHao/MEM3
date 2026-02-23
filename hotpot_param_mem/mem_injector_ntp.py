@@ -95,17 +95,24 @@ class MemInjectorNTP:
         )
         model = get_peft_model(model, lora_cfg)
 
-        tokens = self.tokenizer(snippet, return_tensors="pt", truncation=True, max_length=self.cfg.mem_max_tokens)
+        tokens = self.tokenizer(
+            snippet,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.cfg.mem_max_tokens,
+        )
         input_ids = tokens["input_ids"].cuda()
         attn = tokens["attention_mask"].cuda()
         labels = input_ids.clone()
 
-        optim = AdamW(model.parameters(), lr=self.cfg.mem_lr)
+        # Only optimize trainable (LoRA) params to be robust across versions
+        optim = AdamW((p for p in model.parameters() if p.requires_grad), lr=self.cfg.mem_lr)
+
         loss_val = None
         for _ in range(self.cfg.mem_steps):
             out = model(input_ids=input_ids, attention_mask=attn, labels=labels)
             loss = out.loss
-            optim.zero_grad()
+            optim.zero_grad(set_to_none=True)
             loss.backward()
             optim.step()
             loss_val = float(loss.detach().cpu().item())

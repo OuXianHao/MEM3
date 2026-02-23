@@ -2,43 +2,19 @@ from __future__ import annotations
 
 import re
 import string
-from typing import Dict, List, Sequence, Tuple
+from typing import List, Sequence, Tuple
 
 STOPWORDS = {
-    "the",
-    "a",
-    "an",
-    "is",
-    "are",
-    "was",
-    "were",
-    "to",
-    "of",
-    "and",
-    "or",
-    "in",
-    "on",
-    "for",
-    "with",
-    "by",
-    "at",
-    "from",
-    "that",
-    "this",
-    "which",
-    "who",
-    "what",
-    "when",
-    "where",
-    "why",
-    "how",
+    "the", "a", "an", "is", "are", "was", "were", "to", "of", "and", "or",
+    "in", "on", "for", "with", "by", "at", "from", "that", "this", "which",
+    "who", "what", "when", "where", "why", "how",
 }
 
 _punct_tbl = str.maketrans("", "", string.punctuation)
 
 
 def normalize_tokens(text: str) -> List[str]:
-    text = text.lower().translate(_punct_tbl)
+    text = (text or "").lower().translate(_punct_tbl)
     text = re.sub(r"\s+", " ", text).strip()
     return [tok for tok in text.split(" ") if tok and tok not in STOPWORDS]
 
@@ -52,23 +28,41 @@ def build_paragraphs_from_context(context: Sequence) -> List[str]:
                 para = f"{title}: " + " ".join(str(s) for s in sents)
             else:
                 para = f"{title}: {sents}"
-            paragraphs.append(para.strip())
+            para = para.strip()
+            if para:
+                paragraphs.append(para)
     return paragraphs
 
 
-def retrieve_local(question: str, query: str, context: Sequence, topk: int, max_chars: int) -> Tuple[List[str], str]:
+def retrieve_local(
+    question: str,
+    query: str,
+    context: Sequence,
+    topk: int,
+    max_chars: int,
+) -> Tuple[List[str], str]:
     paragraphs = build_paragraphs_from_context(context)
-    query_tokens = set(normalize_tokens(f"{question} {query}"))
+
+    # Use query tokens primarily; fall back to question if query is empty.
+    q_tokens = set(normalize_tokens(query))
+    if not q_tokens:
+        q_tokens = set(normalize_tokens(question))
+
     scored: List[Tuple[int, int, str]] = []
     for idx, para in enumerate(paragraphs):
         ptoks = set(normalize_tokens(para))
-        overlap = len(query_tokens.intersection(ptoks))
-        scored.append((overlap, -idx, para))
-    scored.sort(reverse=True)
+        overlap = len(q_tokens.intersection(ptoks))
+        scored.append((overlap, idx, para))
+
+    # Sort by overlap desc, then by original index asc (stable & readable).
+    scored.sort(key=lambda x: (-x[0], x[1]))
 
     selected: List[str] = []
     seen = set()
     for overlap, _, para in scored:
+        # Optional noise control: only keep paragraphs with positive overlap.
+        if overlap <= 0:
+            break
         if para in seen:
             continue
         seen.add(para)
