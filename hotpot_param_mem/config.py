@@ -22,6 +22,7 @@ class RunConfig:
     mem_max_tokens: int = 200
     seed: int = 42
     limit: Optional[int] = None
+    sync_every_episodes: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)

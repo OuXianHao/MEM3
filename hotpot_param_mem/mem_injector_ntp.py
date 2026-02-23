@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-import os
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from torch.optim import AdamW
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -33,12 +34,23 @@ class MemInjectorNTP:
         self.tokenizer = AutoTokenizer.from_pretrained(cfg.base_model, use_fast=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-        self.hf_model = AutoModelForCausalLM.from_pretrained(
+        self.dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+        self.base_model = AutoModelForCausalLM.from_pretrained(
             cfg.base_model,
-            torch_dtype=dtype,
+            torch_dtype=self.dtype,
             device_map="cpu",
         )
+        self.base_model.eval()
+        self.target_modules = self._detect_target_modules()
+        self.adapter_cfg = LoraConfig(
+            r=self.cfg.mem_r,
+            lora_alpha=self.cfg.mem_alpha,
+            lora_dropout=self.cfg.mem_dropout,
+            target_modules=self.target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        self.peft_model = get_peft_model(self.base_model, self.adapter_cfg)
 
     def _valid_bullets(self, text: str) -> bool:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -54,9 +66,24 @@ class MemInjectorNTP:
             snippet = self.tokenizer.decode(toks, skip_special_tokens=True)
         return snippet
 
-    def compress_snippet(self, llm_engine, question: str, info_block: str, top1_paragraph: str) -> str:
+    def compress_snippet(
+        self,
+        llm_engine,
+        question: str,
+        info_block: str,
+        top1_paragraph: str,
+        lora_name: Optional[str],
+        lora_int_id: Optional[int],
+        lora_path: Optional[str],
+    ) -> str:
         prompt = build_compression_prompt(question, info_block)
-        output = llm_engine.generate(prompt, max_tokens=180)
+        output = llm_engine.generate(
+            prompt,
+            max_tokens=180,
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_path,
+        )
         snippet = output.strip()
         if not snippet or not self._valid_bullets(snippet):
             snippet = self._fallback_snippet(top1_paragraph)
@@ -75,25 +102,31 @@ class MemInjectorNTP:
     def _detect_target_modules(self):
         wanted = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         names = set()
-        for n, _ in self.hf_model.named_modules():
+        for n, _ in self.base_model.named_modules():
             for w in wanted:
                 if n.endswith(w):
                     names.add(w)
         return sorted(names) or ["q_proj", "v_proj"]
 
-    def train_and_merge(self, snippet: str) -> Tuple[bool, Optional[float], str]:
-        model = self.hf_model.cuda()
-        model.train()
+    def _atomic_save_dir(self, dest_dir: Path, save_fn):
+        dest_dir.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir = Path(tempfile.mkdtemp(prefix=f"{dest_dir.name}.tmp.", dir=str(dest_dir.parent)))
+        try:
+            save_fn(tmp_dir)
+            if dest_dir.exists():
+                shutil.rmtree(dest_dir)
+            tmp_dir.rename(dest_dir)
+        except Exception:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
-        lora_cfg = LoraConfig(
-            r=self.cfg.mem_r,
-            lora_alpha=self.cfg.mem_alpha,
-            lora_dropout=self.cfg.mem_dropout,
-            target_modules=self._detect_target_modules(),
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_cfg)
+    def save_adapter_atomic(self, adapter_dir: str):
+        dest_dir = Path(adapter_dir)
+        self._atomic_save_dir(dest_dir, lambda p: self.peft_model.save_pretrained(str(p)))
+
+    def train_adapter(self, snippet: str) -> Tuple[bool, Optional[float]]:
+        model = self.peft_model.cuda()
+        model.train()
 
         tokens = self.tokenizer(
             snippet,
@@ -105,7 +138,6 @@ class MemInjectorNTP:
         attn = tokens["attention_mask"].cuda()
         labels = input_ids.clone()
 
-        # Only optimize trainable (LoRA) params to be robust across versions
         optim = AdamW((p for p in model.parameters() if p.requires_grad), lr=self.cfg.mem_lr)
 
         loss_val = None
@@ -117,16 +149,37 @@ class MemInjectorNTP:
             optim.step()
             loss_val = float(loss.detach().cpu().item())
 
-        merged = model.merge_and_unload()
-        merged = merged.cpu()
-        self.hf_model = merged
-
-        cache_dir = Path(self.cfg.cache_dir)
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        self.hf_model.save_pretrained(str(cache_dir))
-        self.tokenizer.save_pretrained(str(cache_dir))
-
-        del model
+        self.peft_model = model.cpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        return True, loss_val, str(cache_dir)
+        return True, loss_val
+
+    def load_adapter(self, adapter_dir: str):
+        self.peft_model = PeftModel.from_pretrained(self.base_model, adapter_dir, is_trainable=True)
+
+    def get_adapter_state_dict(self) -> Dict[str, torch.Tensor]:
+        state = self.peft_model.state_dict()
+        out: Dict[str, torch.Tensor] = {}
+        for k, v in state.items():
+            if "lora_" in k:
+                out[k] = v.detach().cpu().clone()
+        return out
+
+    def load_adapter_state_dict(self, state_dict: Dict[str, torch.Tensor]):
+        own_state = self.peft_model.state_dict()
+        for k, v in state_dict.items():
+            if k in own_state:
+                own_state[k].copy_(v)
+
+    def merge_and_save_final(self, adapter_dir: str, output_dir: str):
+        model = AutoModelForCausalLM.from_pretrained(
+            self.cfg.base_model,
+            torch_dtype=self.dtype,
+            device_map="cpu",
+        )
+        peft_model = PeftModel.from_pretrained(model, adapter_dir, is_trainable=False)
+        merged = peft_model.merge_and_unload()
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        merged.save_pretrained(str(out))
+        self.tokenizer.save_pretrained(str(out))

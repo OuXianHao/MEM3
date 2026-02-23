@@ -13,11 +13,29 @@ from .logger import read_jsonl, summarize, write_summary
 from .runner import WorkerContext, run_worker
 
 
-def _worker_entry(gpu_id: str, gpu_tag: str, cfg_dict: Dict, examples: List[Dict]):
+def _worker_entry(
+    gpu_id: str,
+    gpu_tag: str,
+    cfg_dict: Dict,
+    examples: List[Dict],
+    rank: int,
+    world_size: int,
+    dist_init_file: str,
+):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     os.environ["VLLM_USE_RAY"] = "0"
     cfg = RunConfig(**cfg_dict)
-    run_worker(cfg, examples, WorkerContext(gpu_tag=gpu_tag, out_dir=cfg.out))
+    run_worker(
+        cfg,
+        examples,
+        WorkerContext(
+            gpu_tag=gpu_tag,
+            out_dir=cfg.out,
+            rank=rank,
+            world_size=world_size,
+            dist_init_file=dist_init_file,
+        ),
+    )
 
 
 def _find_done_ids(out_dir: Path) -> Set[str]:
@@ -40,6 +58,7 @@ def _merge_jsonl(out_dir: Path, pattern: str, output_name: str):
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return merged
 
+
 def _merge_trace_jsonl(out_dir: Path, pattern: str, output_name: str):
     records: List[Dict] = []
     for path in glob.glob(str(out_dir / pattern)):
@@ -51,6 +70,7 @@ def _merge_trace_jsonl(out_dir: Path, pattern: str, output_name: str):
         for rec in merged:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return merged
+
 
 def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     out_dir = Path(cfg.out)
@@ -80,14 +100,24 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     for i, ex in enumerate(pending):
         chunks[i % len(gpu_ids)].append(ex)
 
+    active = []
+    for wi, gpu_id in enumerate(gpu_ids):
+        if chunks[wi]:
+            active.append((wi, gpu_id, chunks[wi]))
+
+    world_size = len(active)
+    dist_init_file = str((out_dir / "dist_init").resolve())
+    Path(dist_init_file).unlink(missing_ok=True)
+
     ctx = mp.get_context("spawn")
     procs = []
     cfg_dict = cfg.to_dict()
-    for wi, gpu_id in enumerate(gpu_ids):
-        if not chunks[wi]:
-            continue
+    for rank, (wi, gpu_id, chunk) in enumerate(active):
         gpu_tag = f"gpu{gpu_id}"
-        p = ctx.Process(target=_worker_entry, args=(gpu_id, gpu_tag, cfg_dict, chunks[wi]))
+        p = ctx.Process(
+            target=_worker_entry,
+            args=(gpu_id, gpu_tag, cfg_dict, chunk, rank, world_size, dist_init_file),
+        )
         p.start()
         procs.append(p)
 
@@ -103,7 +133,6 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     total_completed = len(merged_eval)
     newly_completed = max(0, total_completed - prev_completed)
 
-    # Summary policy: update every 10 newly completed episodes and at the end.
     checkpoints = max(1, newly_completed // 10)
     for i in range(checkpoints):
         upto = prev_completed + min(newly_completed, (i + 1) * 10)
