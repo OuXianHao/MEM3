@@ -32,6 +32,7 @@ def parse_args():
     p.add_argument("--mem_lr", type=float, default=3e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--limit", type=int, default=None)
+    p.add_argument("--sync_every_episodes", type=int, default=0)
     return p.parse_args()
 
 
@@ -60,6 +61,7 @@ if __name__ == "__main__":
         mem_lr=args.mem_lr,
         seed=args.seed,
         limit=args.limit,
+        sync_every_episodes=args.sync_every_episodes,
     )
     examples = load_hotpot_examples(cfg.data)
     run_multiproc(cfg, examples)
