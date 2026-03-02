@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import shutil
+import json
 import os
+import shutil
 import tempfile
 import time
 from dataclasses import dataclass
@@ -67,7 +68,46 @@ def _atomic_torch_save(obj: Dict[str, torch.Tensor], dest_path: Path):
         raise
 
 
+def _atomic_write_text(text: str, dest_path: Path, encoding: str = "utf-8"):
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=f"{dest_path.name}.tmp.", dir=str(dest_path.parent))
+    os.close(tmp_fd)
+    tmp_path = Path(tmp_name)
+    try:
+        tmp_path.write_text(text, encoding=encoding)
+        tmp_path.replace(dest_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _atomic_write_json(obj: Dict, dest_path: Path):
+    # Stable formatting helps debugging and avoids noisy diffs.
+    text = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    _atomic_write_text(text, dest_path)
+
+
+def _read_json(path: Path) -> Optional[Dict]:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _read_latest_global_meta(adapters_dir: Path, latest_round: int) -> Dict:
+    """Returns meta dict for latest global round if exists, else {}."""
+    if latest_round <= 0:
+        return {}
+    meta_path = adapters_dir / "global" / f"round_{latest_round}" / "META.json"
+    meta = _read_json(meta_path)
+    return meta or {}
+
+
 def _sum_all_ranks_int(value: int) -> int:
+    if not (dist.is_available() and dist.is_initialized()):
+        return int(value)
     t = torch.tensor([value], dtype=torch.int64, device="cuda" if torch.cuda.is_available() else "cpu")
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return int(t.item())
@@ -99,6 +139,9 @@ def _cleanup_after_sync(adapters_dir: Path, rank: int, keep_global: int = 2):
         for child in local_dir.iterdir():
             if child.is_dir() and child.name.startswith("ep"):
                 shutil.rmtree(child, ignore_errors=True)
+            if child.is_dir() and child.name.startswith("sync_round_"):
+                shutil.rmtree(child, ignore_errors=True)
+
     global_dir = adapters_dir / "global"
     if global_dir.exists():
         rounds: List[Tuple[int, Path]] = []
@@ -132,13 +175,13 @@ def _finalize_dist(ctx: WorkerContext):
 def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
     out_dir = Path(ctx.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     adapters_dir = out_dir / "adapters"
     trace_logger = JsonlLogger(str(out_dir / f"episode_trace.{ctx.gpu_tag}.jsonl"))
     eval_logger = JsonlLogger(str(out_dir / f"eval_results.{ctx.gpu_tag}.jsonl"))
 
-    _maybe_init_dist(ctx)
-
     llm = VLLMEngine(VLLMConfig(model=config.model, temperature=config.temperature))
+    _maybe_init_dist(ctx)
     injector = None
     if config.train_mem:
         injector = MemInjectorNTP(
@@ -154,70 +197,119 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
             )
         )
 
+    # ---- Resume: discover latest global round + read META.json for global_completed offset ----
     global_round = _find_latest_global_round(adapters_dir)
+    latest_meta = _read_latest_global_meta(adapters_dir, global_round)
+
+    # global_completed_offset: total completed episodes up to (and including) the latest sync point.
+    global_completed_offset = int(latest_meta.get("global_completed", 0)) if latest_meta else 0
+
     if injector is not None and global_round > 0:
         injector.load_adapter(str(adapters_dir / "global" / f"round_{global_round}"))
 
-    local_completed_episodes = 0
+    local_completed_episodes = 0  # completed in THIS run (per-rank)
+
     sync_round = global_round
     next_sync_at = config.sync_every_episodes * (sync_round + 1)
+
     local_version_id = 0
     local_dirty_since_sync = False
 
     def current_lora_selector(use_local: bool, episode_id: str):
+        # no injector => baseline => no lora
+        if injector is None:
+            return (None, None, None)
+
         if use_local and local_version_id > 0:
             p = adapters_dir / f"local_gpu{ctx.rank}" / f"ep{episode_id}" / f"v{local_version_id}"
-            return (f"local_rank{ctx.rank}", 200000 + local_version_id, str(p))
+            if p.exists():
+                return (f"local_rank{ctx.rank}", 200000 + local_version_id, str(p))
+
+        # global adapter only valid if round dir exists
         p = adapters_dir / "global" / f"round_{global_round}"
-        return ("global", 100000 + global_round, str(p))
+        if global_round > 0 and (p / "adapter_config.json").exists():
+            return ("global", 100000 + global_round, str(p))
+
+        return (None, None, None)
+
+    def _compute_global_completed_total() -> int:
+        """
+        Returns the global total completed episodes across all ranks, accounting for
+        resume offset (from latest META.json).
+        """
+        if ctx.world_size > 1:
+            since_start = _sum_all_ranks_int(local_completed_episodes)
+        else:
+            since_start = local_completed_episodes
+        return global_completed_offset + since_start
 
     def run_sync_if_needed(force: bool = False):
-        nonlocal sync_round, next_sync_at, global_round, local_dirty_since_sync
+        nonlocal sync_round, next_sync_at, global_round, local_dirty_since_sync, global_completed_offset
+
         if injector is None or config.sync_every_episodes <= 0:
             return
-        global_completed_episodes = _sum_all_ranks_int(local_completed_episodes) if ctx.world_size > 1 else local_completed_episodes
-        if not force and global_completed_episodes < next_sync_at:
+
+        global_completed_total = _compute_global_completed_total()
+
+        # Normal sync gate.
+        if not force and global_completed_total < next_sync_at:
             return
 
         target_round = sync_round + 1
+
+        # 1) Each rank writes its current adapter state to disk for this sync round.
         local_sync_dir = adapters_dir / f"local_gpu{ctx.rank}" / f"sync_round_{target_round}"
         state_path = local_sync_dir / "adapter_state.pt"
         local_state = injector.get_adapter_state_dict()
         _atomic_torch_save(local_state, state_path)
 
+        # 2) Barrier #1
         if ctx.world_size > 1:
             dist.barrier()
 
+        # 3) Rank0 loads all local adapter states, averages, writes global adapter dir + META + DONE.
         global_round_dir = adapters_dir / "global" / f"round_{target_round}"
         done_marker = global_round_dir / "DONE"
-        if ctx.rank == 0:
-            paths = [adapters_dir / f"local_gpu{r}" / f"sync_round_{target_round}" / "adapter_state.pt" for r in range(ctx.world_size)]
-            avg_state = _average_adapter_states(paths)
-            (adapters_dir / "global").mkdir(parents=True, exist_ok=True)
-            tmp_dir = Path(tempfile.mkdtemp(prefix=f"round_{target_round}.tmp.", dir=str((adapters_dir / 'global'))))
-            try:
-                injector.peft_model.save_pretrained(str(tmp_dir))
-                model_path = tmp_dir / "adapter_model.bin"
-                _atomic_torch_save(avg_state, model_path)
-                if global_round_dir.exists():
-                    shutil.rmtree(global_round_dir)
-                tmp_dir.rename(global_round_dir)
-                done_marker.write_text("ok\n", encoding="utf-8")
-            except Exception:
-                shutil.rmtree(tmp_dir, ignore_errors=True)
-                raise
+        meta_path = global_round_dir / "META.json"
 
+        if ctx.rank == 0:
+            paths = [
+                adapters_dir / f"local_gpu{r}" / f"sync_round_{target_round}" / "adapter_state.pt"
+                for r in range(ctx.world_size)
+            ]
+            avg_state = _average_adapter_states(paths)
+            meta = {
+                "round": target_round,
+                "global_completed": global_completed_total,
+                "sync_every_episodes": config.sync_every_episodes,
+                "world_size": ctx.world_size,
+                "created_at_unix": int(time.time()),
+                "source_states": [str(p) for p in paths],
+            }
+            # Atomically publish adapter dir + META.json + DONE in ONE step
+            injector.save_avg_adapter_dir_atomic(avg_state, str(global_round_dir), meta)
+
+        # 4) Barrier #2
         if ctx.world_size > 1:
             dist.barrier()
 
+        # Ensure published
         if not done_marker.exists():
             raise RuntimeError(f"Global adapter round missing DONE marker: {done_marker}")
+        if not meta_path.exists():
+            raise RuntimeError(f"Global adapter round missing META.json: {meta_path}")
 
+        # 5) All ranks load the new global adapter (overwrite local state), update round counters.
         injector.load_adapter(str(global_round_dir))
         global_round = target_round
         sync_round = target_round
         next_sync_at = config.sync_every_episodes * (sync_round + 1)
+
+        # Update resume offset to the latest synced global_completed_total.
+        # After sync, we consider "everything up to this sync" as offset, so future totals are consistent.
+        global_completed_offset = global_completed_total
         local_dirty_since_sync = False
+
         _cleanup_after_sync(adapters_dir, ctx.rank, keep_global=2)
 
     completed = 0
@@ -226,9 +318,11 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
         question = ex.get("question", "")
         gold = ex.get("answer", "")
         context = ex.get("context", [])
+
         history = []
         forced_terminate = False
         pred = "unknown"
+
         step_count = 0
         search_count = 0
         updates = 0
@@ -237,7 +331,9 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
         for step_id in range(config.max_steps):
             step_count += 1
             t0 = time.time()
+
             lora_name, lora_int_id, lora_path = current_lora_selector(use_local_inference, episode_id)
+
             if step_id == 0:
                 action_type = "search"
                 query = make_step0_query(question)
@@ -272,18 +368,27 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                         "time_gen": time.time() - t0,
                         "time_update": 0.0,
                         "forced_terminate": forced_terminate,
+                        "global_round": global_round,
+                        "local_version_id": local_version_id,
                     }
                 )
                 break
 
             search_count += 1
-            paras, info_block = retrieve_local(question, query, context, topk=config.topk, max_chars=config.max_chars)
+            paras, info_block = retrieve_local(
+                question,
+                query,
+                context,
+                topk=config.topk,
+                max_chars=config.max_chars,
+            )
             history.append((query, info_block))
 
             snippet = None
             mem_updated = False
             mem_loss = None
             t_update = 0.0
+
             if injector is not None:
                 tu = time.time()
                 snippet = injector.compress_snippet(
@@ -299,7 +404,12 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                     ok, mem_loss = injector.train_adapter(snippet)
                     if ok:
                         local_version_id += 1
-                        local_dir = adapters_dir / f"local_gpu{ctx.rank}" / f"ep{episode_id}" / f"v{local_version_id}"
+                        local_dir = (
+                            adapters_dir
+                            / f"local_gpu{ctx.rank}"
+                            / f"ep{episode_id}"
+                            / f"v{local_version_id}"
+                        )
                         injector.save_adapter_atomic(str(local_dir))
                         mem_updated = True
                         updates += 1
@@ -321,9 +431,10 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                     "time_gen": time.time() - t0,
                     "time_update": t_update,
                     "forced_terminate": forced_terminate,
+                    "global_round": global_round,
+                    "local_version_id": local_version_id,
                 }
             )
-
         else:
             forced_terminate = True
             pred = "unknown"
@@ -340,6 +451,7 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                 "searches": search_count,
                 "updates": updates,
                 "forced_terminate": forced_terminate,
+                "global_round": global_round,
             }
         )
         eval_logger.flush()
@@ -357,18 +469,22 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
                     "gpu_tag": ctx.gpu_tag,
                     "avg_steps": sum(r.get("steps", 0) for r in eval_records) / max(1, len(eval_records)),
                     "avg_searches": sum(r.get("searches", 0) for r in eval_records) / max(1, len(eval_records)),
-                    "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0) / max(1, len(eval_records)),
+                    "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0)
+                    / max(1, len(eval_records)),
                     "args": config.to_dict(),
+                    "global_round": global_round,
                 },
             )
             write_summary(str(out_dir / f"summary.{ctx.gpu_tag}.json"), summary)
 
+    # Final forced sync if any rank is dirty since last sync.
     if injector is not None and config.sync_every_episodes > 0:
         dirty = 1 if local_dirty_since_sync else 0
         global_dirty = _sum_all_ranks_int(dirty) if ctx.world_size > 1 else dirty
         if global_dirty > 0:
             run_sync_if_needed(force=True)
 
+    # Final merged model output (rank0 only) based on latest global adapter.
     if injector is not None and config.sync_every_episodes > 0 and ctx.rank == 0:
         final_round_dir = adapters_dir / "global" / f"round_{global_round}"
         if final_round_dir.exists():
@@ -383,9 +499,11 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
             "avg_searches": sum(r.get("searches", 0) for r in eval_records) / max(1, len(eval_records)),
             "update_rate": sum(1 for r in eval_records if r.get("updates", 0) > 0) / max(1, len(eval_records)),
             "args": config.to_dict(),
+            "global_round": global_round,
         },
     )
     write_summary(str(out_dir / f"summary.{ctx.gpu_tag}.json"), summary)
+
     trace_logger.close()
     eval_logger.close()
     _finalize_dist(ctx)

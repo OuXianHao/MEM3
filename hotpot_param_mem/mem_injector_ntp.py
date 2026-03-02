@@ -6,7 +6,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional, Tuple
-
+import json
+from typing import List 
 import torch
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch.optim import AdamW
@@ -123,6 +124,34 @@ class MemInjectorNTP:
     def save_adapter_atomic(self, adapter_dir: str):
         dest_dir = Path(adapter_dir)
         self._atomic_save_dir(dest_dir, lambda p: self.peft_model.save_pretrained(str(p)))
+        
+    def save_avg_adapter_dir_atomic(self, avg_state: Dict[str, torch.Tensor], adapter_dir: str, meta: Dict):
+        """
+        Atomically publish a PEFT-loadable adapter directory for the averaged LoRA state,
+        including META.json and DONE marker in the same atomic directory rename.
+        This avoids assuming adapter_model.bin vs adapter_model.safetensors.
+        """
+        dest_dir = Path(adapter_dir)
+
+        def _save(tmp_dir: Path):
+            # (1) Create correct adapter directory structure
+            self.peft_model.save_pretrained(str(tmp_dir))
+
+            # (2) Load averaged LoRA weights into current PEFT model (only lora_ keys)
+            with torch.no_grad():
+                self.peft_model.load_state_dict(avg_state, strict=False)
+
+            # (3) Save again so weights are written in the proper format (bin/safetensors)
+            self.peft_model.save_pretrained(str(tmp_dir))
+
+            # (4) Write META + DONE inside tmp_dir BEFORE publish
+            (tmp_dir / "META.json").write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            (tmp_dir / "DONE").write_text("ok\n", encoding="utf-8")
+
+        self._atomic_save_dir(dest_dir, _save)
 
     def train_adapter(self, snippet: str) -> Tuple[bool, Optional[float]]:
         model = self.peft_model.cuda()

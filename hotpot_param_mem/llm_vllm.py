@@ -23,7 +23,7 @@ STOP_STRINGS = [
 class VLLMConfig:
     model: str
     temperature: float = 0.0
-    gpu_memory_utilization: float = 0.85
+    gpu_memory_utilization: float = 0.55
 
 
 class VLLMEngine:
@@ -38,6 +38,7 @@ class VLLMEngine:
             tensor_parallel_size=1,
             gpu_memory_utilization=self.cfg.gpu_memory_utilization,
             distributed_executor_backend="mp",
+             enforce_eager=True, 
         )
 
     def generate(

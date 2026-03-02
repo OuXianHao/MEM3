@@ -3,7 +3,12 @@ from __future__ import annotations
 import glob
 import json
 import multiprocessing as mp
+try:
+    mp.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
 import os
+
 from pathlib import Path
 from typing import Dict, List, Sequence, Set
 
@@ -22,8 +27,18 @@ def _worker_entry(
     world_size: int,
     dist_init_file: str,
 ):
+    # 1) 必须最早设置：让该 rank 只看到 1 张物理 GPU
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     os.environ["VLLM_USE_RAY"] = "0"
+
+    # 2) 可选但强烈推荐：让 vLLM worker 用 spawn（你命令行也可以设）
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+    # 3) 现在再 import torch，并固定当前进程 device=0
+    import torch
+    if torch.cuda.is_available():
+        torch.cuda.set_device(0)
+
     cfg = RunConfig(**cfg_dict)
     run_worker(
         cfg,
@@ -63,7 +78,6 @@ def _merge_trace_jsonl(out_dir: Path, pattern: str, output_name: str):
     records: List[Dict] = []
     for path in glob.glob(str(out_dir / pattern)):
         records.extend(read_jsonl(Path(path)))
-
     merged = sort_trace_records(records)
     out_path = out_dir / output_name
     with open(out_path, "w", encoding="utf-8") as f:
@@ -78,6 +92,7 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
 
     done_ids = _find_done_ids(out_dir)
     pending = [ex for ex in all_examples if str(ex["episode_id"]) not in done_ids]
+
     if cfg.limit is not None:
         pending = pending[: cfg.limit]
 
@@ -112,6 +127,7 @@ def run_multiproc(cfg: RunConfig, all_examples: Sequence[Dict]):
     ctx = mp.get_context("spawn")
     procs = []
     cfg_dict = cfg.to_dict()
+
     for rank, (wi, gpu_id, chunk) in enumerate(active):
         gpu_tag = f"gpu{gpu_id}"
         p = ctx.Process(
