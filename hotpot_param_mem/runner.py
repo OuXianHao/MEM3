@@ -96,6 +96,18 @@ def _read_json(path: Path) -> Optional[Dict]:
         return None
 
 
+def sanitize_query(q: str, max_len: int = 96) -> str:
+    q = (q or "").strip()
+    # 只取第一行，防止把 evidence 或列表带进去
+    q = q.splitlines()[0].strip()
+    # 压缩空白
+    q = " ".join(q.split())
+    # 截断
+    if len(q) > max_len:
+        q = q[:max_len].rstrip()
+    return q
+
+
 def _read_latest_global_meta(adapters_dir: Path, latest_round: int) -> Dict:
     """Returns meta dict for latest global round if exists, else {}."""
     if latest_round <= 0:
@@ -108,12 +120,20 @@ def _read_latest_global_meta(adapters_dir: Path, latest_round: int) -> Dict:
 def _sum_all_ranks_int(value: int) -> int:
     if not (dist.is_available() and dist.is_initialized()):
         return int(value)
-    t = torch.tensor([value], dtype=torch.int64, device="cuda" if torch.cuda.is_available() else "cpu")
+    
+    # ✅ 修复：避免多卡跨卡通信导致的显存泄露和挂起
+    if torch.cuda.is_available():
+        rank = dist.get_rank()
+        device = f"cuda:{rank % torch.cuda.device_count()}"
+    else:
+        device = "cpu"
+        
+    t = torch.tensor([value], dtype=torch.int64, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return int(t.item())
 
 
-def _average_adapter_states(paths: List[Path]) -> Dict[str, torch.Tensor]:
+def _average_adapter_states(paths: List[Path], decay_factor: float = 0.98) -> Dict[str, torch.Tensor]:
     summed: Dict[str, torch.Tensor] = {}
     count = 0
     for p in paths:
@@ -128,12 +148,15 @@ def _average_adapter_states(paths: List[Path]) -> Dict[str, torch.Tensor]:
         count += 1
     if count == 0:
         raise RuntimeError("No adapter states found to aggregate")
+    
+    # 🚀 修复：在平均之后，乘以一个衰减系数 (0.98)
     for k in summed:
-        summed[k].div_(float(count))
+        summed[k].div_(float(count)).mul_(decay_factor)  # 👈 新增 .mul_(decay_factor)
     return summed
 
 
 def _cleanup_after_sync(adapters_dir: Path, rank: int, keep_global: int = 2):
+    # 1. 各个 GPU 清理自己的本地目录（无需更改）
     local_dir = adapters_dir / f"local_gpu{rank}"
     if local_dir.exists():
         for child in local_dir.iterdir():
@@ -142,17 +165,20 @@ def _cleanup_after_sync(adapters_dir: Path, rank: int, keep_global: int = 2):
             if child.is_dir() and child.name.startswith("sync_round_"):
                 shutil.rmtree(child, ignore_errors=True)
 
-    global_dir = adapters_dir / "global"
-    if global_dir.exists():
-        rounds: List[Tuple[int, Path]] = []
-        for p in global_dir.glob("round_*"):
-            rn = _parse_round_num(p, "round_")
-            if rn is not None:
-                rounds.append((rn, p))
-        rounds.sort(key=lambda x: x[0])
-        if len(rounds) > keep_global:
-            for _, p in rounds[: len(rounds) - keep_global]:
-                shutil.rmtree(p, ignore_errors=True)
+    # 2. ✅ 核心修复：只有 Rank 0 有资格清理 global 目录，防止 8 卡踩踏
+    if rank == 0:
+        global_dir = adapters_dir / "global"
+        if global_dir.exists():
+            rounds: List[Tuple[int, Path]] = []
+            for p in global_dir.glob("round_*"):
+                rn = _parse_round_num(p, "round_")
+                if rn is not None:
+                    rounds.append((rn, p))
+            
+            rounds.sort(key=lambda x: x[0])
+            if len(rounds) > keep_global:
+                for _, p in rounds[: len(rounds) - keep_global]:
+                    shutil.rmtree(p, ignore_errors=True)
 
 
 def _maybe_init_dist(ctx: WorkerContext):
@@ -305,21 +331,37 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
         sync_round = target_round
         next_sync_at = config.sync_every_episodes * (sync_round + 1)
 
-        # Update resume offset to the latest synced global_completed_total.
-        # After sync, we consider "everything up to this sync" as offset, so future totals are consistent.
-        global_completed_offset = global_completed_total
-        local_dirty_since_sync = False
+        # ✅ 修复：保持偏移量不变
+        local_dirty_since_sync = False  # 仅重置脏标记即可
 
         _cleanup_after_sync(adapters_dir, ctx.rank, keep_global=2)
+    if ctx.world_size > 1:
+        # 获取当前卡的设备和真实数据长度
+        device = f"cuda:{ctx.rank % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu"
+        local_len = len(examples)
+        local_len_t = torch.tensor([local_len], dtype=torch.int64, device=device)
+        
+        # 强制所有卡通信一次，找出分配到最多数据的卡的长度
+        dist.all_reduce(local_len_t, op=dist.ReduceOp.MAX)
+        max_len = int(local_len_t.item())
 
+        # 如果当前卡的数据比 max_len 少，就在列表末尾用 None 补齐差额
+        if local_len < max_len:
+            pad_count = max_len - local_len
+            examples.extend([None] * pad_count)
     completed = 0
     for ex in examples:
+        if ex is None:
+            run_sync_if_needed(force=False)
+            continue
         episode_id = _episode_key(ex)
         question = ex.get("question", "")
         gold = ex.get("answer", "")
         context = ex.get("context", [])
 
         history = []
+        used_queries = set()  # ✅ anti-repeat guard at execution level
+
         forced_terminate = False
         pred = "unknown"
 
@@ -334,61 +376,102 @@ def run_worker(config: RunConfig, examples: List[Dict], ctx: WorkerContext):
 
             lora_name, lora_int_id, lora_path = current_lora_selector(use_local_inference, episode_id)
 
+            # -----------------------
+            # Decide next action
+            # -----------------------
             if step_id == 0:
                 action_type = "search"
-                query = make_step0_query(question)
+                query = sanitize_query(make_step0_query(question))
                 raw = "[forced_step0_search]"
             else:
                 prompt = build_state_prompt(question, history)
                 raw = llm.generate(
                     prompt,
-                    max_tokens=128,
+                    max_tokens=64,
+                    temperature=0.0,
                     lora_name=lora_name,
                     lora_int_id=lora_int_id,
                     lora_path=lora_path,
+                    stop=["</search>", "</answer>"],
                 )
+                
+                # ✅ 修复：处理 vLLM 默认吃掉 stop string 导致截断的问题
+                raw = (raw or "").strip()
+                if raw.startswith("<search>") and not raw.endswith("</search>"):
+                    raw += "</search>"
+                elif raw.startswith("<answer>") and not raw.endswith("</answer>"):
+                    raw += "</answer>"
+
                 parsed = parse_first_action(raw)
                 action_type = parsed.action_type
                 forced_terminate = forced_terminate or parsed.forced_terminate
-                query = parsed.content
 
-            if action_type == "answer":
-                pred = query or "unknown"
-                trace_logger.write(
-                    {
-                        "episode_id": episode_id,
-                        "step_id": step_id,
-                        "raw_model_output": raw,
-                        "action_type": "answer",
-                        "search_query": None,
-                        "information": None,
-                        "snippet": None,
-                        "mem_updated": False,
-                        "mem_loss": None,
-                        "time_gen": time.time() - t0,
-                        "time_update": 0.0,
-                        "forced_terminate": forced_terminate,
-                        "global_round": global_round,
-                        "local_version_id": local_version_id,
-                    }
-                )
-                break
+                # Fallback if parsing failed / unexpected
+                if action_type not in ("search", "answer"):
+                    action_type = "search"
+                    query = sanitize_query(make_step0_query(question))
+                elif action_type == "answer":
+                    # ✅ DO NOT sanitize answer
+                    pred = (parsed.content or "").strip() or "unknown"
+                    trace_logger.write(
+                        {
+                            "episode_id": episode_id,
+                            "step_id": step_id,
+                            "raw_model_output": raw,
+                            "action_type": "answer",
+                            "search_query": None,
+                            "information": None,
+                            "snippet": None,
+                            "mem_updated": False,
+                            "mem_loss": None,
+                            "time_gen": time.time() - t0,
+                            "time_update": 0.0,
+                            "forced_terminate": forced_terminate,
+                            "global_round": global_round,
+                            "local_version_id": local_version_id,
+                        }
+                    )
+                    break
+                else:
+                    query = sanitize_query(parsed.content)
 
-            search_count += 1
-            paras, info_block = retrieve_local(
-                question,
-                query,
-                context,
-                topk=config.topk,
-                max_chars=config.max_chars,
-            )
-            history.append((query, info_block))
+            # -----------------------
+            # Search sanity / anti-repeat guard
+            # -----------------------
+            if action_type == "search":
+                if len(query) < 3:
+                    query = sanitize_query(make_step0_query(question))
+
+                qnorm = query.lower().strip()
+                search_count += 1
+                
+                is_repeat = qnorm in used_queries
+                used_queries.add(qnorm)
+
+                if is_repeat:
+                    # ✅ 核心修复：拦截重复搜索。不再退回 Step0，而是直接向大模型注入“系统警告”，打断施法
+                    paras = []
+                    info_block = "[System Warning: You have already searched this exact query. No new information found. You MUST output <answer> in your next turn based on what you already know.]"
+                else:
+                    # 正常的搜索流程
+                    paras, info_block = retrieve_local(
+                        question,
+                        query,
+                        context,
+                        topk=config.topk,
+                        max_chars=config.max_chars,
+                    )
+                
+                history.append((query, info_block))
 
             snippet = None
             mem_updated = False
             mem_loss = None
             t_update = 0.0
 
+            # -----------------------
+            # Optional memory update
+            # -----------------------
             if injector is not None:
                 tu = time.time()
                 snippet = injector.compress_snippet(

@@ -13,10 +13,11 @@ STOPWORDS = {
 _punct_tbl = str.maketrans("", "", string.punctuation)
 
 
+
 def normalize_tokens(text: str) -> List[str]:
     text = (text or "").lower().translate(_punct_tbl)
     text = re.sub(r"\s+", " ", text).strip()
-    return [tok for tok in text.split(" ") if tok and tok not in STOPWORDS]
+    return [tok for tok in text.split(" ") if tok]
 
 
 def build_paragraphs_from_context(context: Sequence) -> List[str]:

@@ -3,83 +3,94 @@ from __future__ import annotations
 import re
 from typing import List, Tuple
 
-SYSTEM_RULES = """You are a LOCAL multi-hop QA agent. You can ONLY use the provided local context evidence (no internet, no outside knowledge).
 
-You operate in steps. At each step, you will see:
-- [QUESTION]
-- [HISTORY] consisting of repeated blocks:
-  <search>...</search>
-  <information>...</information>
+# 更像“师兄模板”的短规则：保留原语义，但压缩表达，减少模型复读/走神
+SYSTEM_RULES = """You are a LOCAL multi-hop QA agent. Use ONLY the provided local evidence in <history>. No outside knowledge.
 
-Your job is to decide the NEXT action. Output EXACTLY ONE action:
-- <search>...</search>
-- <answer>...</answer>
+At each step, output EXACTLY ONE tag:
+- <search>KEYWORDS</search>
+- <answer>ANSWER</answer>
 
-CRITICAL RULES:
-1) Evidence-only:
-- Base all decisions ONLY on the <information> in HISTORY.
-- Do NOT guess or use outside knowledge.
-- If the needed fact cannot be found from the local context, output <answer>unknown</answer>.
-
-2) Multi-hop progress (missing-slot):
-- Most questions require multiple hops.
-- After reading HISTORY, identify ONE missing slot that is still missing and is required to answer the question
-  (e.g., "<entity> nationality", "<entity> author", a "bridge entity" name).
-- Your next <search> MUST target exactly that missing slot using entity-focused keywords.
-
-3) Search rules (what to search):
-- Prefer "<entity>" or "<entity> + <attribute>".
-- Avoid generic filler words like "information", "details", "about", unless part of a proper name.
-- If there are two main entities in the question, search them one by one, then connect them via a bridge entity if needed.
-- Do NOT search for facts that already appear in HISTORY.
-- Do NOT re-search an attribute once it has been found for an entity.
-
-4) Anti-repeat (query-level):
-- Do NOT repeat a previous <search> query exactly.
-- If you would repeat, switch to a different missing slot or use a different formulation.
-
-STOPPING RULE:
-- If the evidence in HISTORY is already sufficient to answer the Question, output <answer>...</answer> immediately.
-- If after several searches the needed fact is still not found in HISTORY, output <answer>unknown</answer>.
-
-OUTPUT FORMAT (STRICT):
-- Output ONLY the action tag. No other text outside <search>...</search> or <answer>...</answer>.
+Rules:
+1) Answer-first: If <history> contains enough facts to answer the question, output <answer>...</answer> immediately.
+2) Evidence-only: Base your answer STRICTLY on facts in <history>. Do not hallucinate.
+3) Missing-slot: If you cannot answer yet, output <search>KEYWORDS</search> to find the missing fact.
+4) Anti-repeat: Do NOT repeat a previous <search> exactly.
+5) Query format: short keyword query only (<=8 words, <=80 chars). No ':', no quotes, no bullets, no copying lines from <history>.
 """
 
 
 def make_step0_query(question: str) -> str:
+    # 过滤掉常见的疑问词，防止提取出 "What", "Who" 作为盲搜关键字
+    stopwords = {"What", "Who", "Where", "When", "Why", "How", "Which", "Is", "Are", "Do", "Does", "Did"}
+    
     # Deterministic, entity-focused heuristic.
     caps = re.findall(r"\b[A-Z][a-zA-Z0-9\-]*\b", question)
-    if caps:
-        return " ".join(caps[:6])
+    filtered_caps = [w for w in caps if w not in stopwords]
+    
+    if filtered_caps:
+        return " ".join(filtered_caps[:6])
+        
     words = re.findall(r"[A-Za-z0-9]+", question.lower())
     return " ".join(words[:8])
 
 
-def build_state_prompt(question: str, history: List[Tuple[str, str]]) -> str:
-    blocks = []
+def _truncate_text(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars].rstrip() + " ..."
+
+
+def build_state_prompt(question: str, history: List[Tuple[str, str]]):
+    # ---------- Previous queries (keep last 8, dedup consecutive) ----------
+    prev_queries: List[str] = []
+    for q, _ in history:
+        q = (q or "").strip()
+        if q and (not prev_queries or q != prev_queries[-1]):
+            prev_queries.append(q)
+    prev_queries = prev_queries[-8:]
+
+    prev_text = "\n".join(prev_queries) if prev_queries else "(none)"
+
+    # ---------- HISTORY: keep recent blocks to reduce noise (align with brother style) ----------
+    # 只保留最后 4 个检索块（可按需调，但这是最稳的默认）
+    history = history[-4:]
+
+    blocks: List[str] = []
     for query, info_block in history:
-        blocks.append(f"<search>{query}</search>\n{info_block}")
-    history_text = "\n".join(blocks).strip()
+        # info_block 可能很长；截断减少噪声（不改变逻辑，只减少干扰）
+        info_block = _truncate_text(info_block, max_chars=1800)
+        blocks.append(f"<search>{(query or '').strip()}</search>\n{info_block}")
+    history_text = "\n".join(blocks).strip() if blocks else "(empty)"
+
+    # ---------- Compose prompt (short, template-like) ----------
     return (
-        f"[SYSTEM RULES]\n{SYSTEM_RULES}\n\n"
-        f"[QUESTION]\n{question}\n\n"
-        f"[HISTORY]\n{history_text}\n"
+        f"{SYSTEM_RULES}\n\n"
+        f"<question>\n{question}\n</question>\n\n"
+        f"<prev_queries>\n{prev_text}\n</prev_queries>\n\n"
+        f"<history>\n{history_text}\n</history>\n\n"
+        "Output ONLY ONE tag: <search>...</search> OR <answer>...</answer>.\n"
+        "Your Output:\n"  # 👈 强引导词，逼迫模型开口
     )
 
 
 def build_compression_prompt(question: str, information_block: str) -> str:
     return (
-        "You are compressing retrieved evidence for a QA agent to memorize.\n\n"
-        f"Question: {question}\n\n"
-        "Evidence (verbatim):\n"
-        f"{information_block}\n\n"
-        "Task: Extract ONLY the key facts from the Evidence that directly help answer the Question.\n"
+        "<question>\n"
+        f"{question}\n"
+        "</question>\n\n"
+        "<evidence>\n"
+        f"{information_block}\n"
+        "</evidence>\n\n"
+        "Content for test-time training (TTT): extract ONLY the key facts from <evidence> that help answer <question>.\n"
+        "Write the facts inside <snippet>...</snippet>.\n"
         "Rules:\n"
-        "- Output 3–6 bullet facts.\n"
-        "- Each bullet must be <= 20 words.\n"
-        "- Use ONLY facts explicitly stated in the Evidence; NO speculation or outside knowledge.\n"
-        "- Prefer named entities, dates, locations, and explicit relations.\n"
-        "- Output ONLY the bullets. No title, no preface, no extra lines.\n"
-        "- Format: each line starts with '- '.\n"
+        "- Use ONLY facts explicitly stated in <evidence>.\n"
+        "- 1 to 6 short lines, each <= 18 words.\n"
+        "- Each line is a standalone fact (entity + relation + value).\n"
+        "- No analysis, no reasoning, no instructions.\n"
+        "- No citations like [1]. No bullets like '-', '*', '1)'.\n"
+        "- If nothing useful, output exactly <snippet>NONE</snippet>.\n\n"
+        "Your Output:\n" # 👈 不要在这里写 <snippet>，让模型自己生成！
     )
